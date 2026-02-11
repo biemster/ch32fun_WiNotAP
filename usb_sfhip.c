@@ -35,6 +35,16 @@ int USBFS_SendEndpointNEW(int ep, uint8_t *data, int len, int copy) { return USB
 #define LED PA8
 #endif
 
+#ifndef ROM_CFG_MAC_ADDR // should be updated in ch5xxhw.h
+#define ROM_CFG_MAC_ADDR		((const u32*)0x0007f018)
+#endif
+#define MAC_PREFIX              0xc632 // should have used base 18
+
+#define USB_DATA_BUF_SIZE 2048
+__attribute__((aligned(4))) static volatile uint8_t gs_usb_data_buf[USB_DATA_BUF_SIZE];
+static int16_t gs_usb_data_len;
+static int gs_usb_data_write_idx;
+
 sfhip hip = {
 	.ip = 0,
 	.mask = 0,
@@ -112,6 +122,29 @@ void HandleDataOut(struct _USBState *ctx, int endp, uint8_t *data, int len) {
 		}
 		else {
 			// received (part of) an ethernet frame
+			if(gs_usb_data_len == 0) {
+				// first part of frame
+				gs_usb_data_len = *(int16_t*)data;
+				if(len == USBFS_PACKET_SIZE || len == gs_usb_data_len +2) {
+					memcpy((uint8_t*)gs_usb_data_buf, &data[2], len -2);
+					gs_usb_data_write_idx = len -2;
+				}
+				else {
+					// first two bytes were definitely not frame len
+					gs_usb_data_len = 0;
+				}
+			}
+			else if(gs_usb_data_write_idx == gs_usb_data_len) {
+				// previous frame is not processed yet, drop this frame
+			}
+			else if((gs_usb_data_write_idx +len) > gs_usb_data_len) {
+				// something went wrong, we're getting more data than the frame should be
+			}
+			else {
+				// continuation of frame
+				memcpy((uint8_t*)&gs_usb_data_buf[gs_usb_data_write_idx], data, len);
+				gs_usb_data_write_idx += len;
+			}
 		}
 
 		ctx->USBFS_Endp_Busy[EP_FRAME_OUT] = 0;
@@ -145,14 +178,28 @@ int HandleSetupCustom( struct _USBState *ctx, int setup_code ) {
 // WiNot rx/tx
 int winot_send_packet(const uint8_t *data, int length) {
 	for(int i = 0; i < length; i += USBFS_PACKET_SIZE) {
-		USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0);
+		if(USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0) == -1) {
+			// retry once
+			Delay_Ms(1);
+			USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0);
+		}
 	}
 	printf("sent frame of %d bytes\n", length);
 	return length;
 }
 
 uint8_t* winot_poll_packet(uint16_t *length) {
-	return NULL;
+	uint8_t *res = NULL;
+	if(gs_usb_data_len && gs_usb_data_write_idx == gs_usb_data_len) {
+		res = (uint8_t*)gs_usb_data_buf;
+		*length = gs_usb_data_len;
+	}
+	return res;
+}
+
+void winot_release_packet() {
+	gs_usb_data_write_idx = 0;
+	gs_usb_data_len = 0;
 }
 
 // ----------
@@ -214,6 +261,12 @@ int main( void ) {
 
 	USBFSSetup();
 
+	((uint8_t *)&hip.self_mac)[0] = MAC_PREFIX >> 8;
+	((uint8_t *)&hip.self_mac)[1] = MAC_PREFIX & 0xff;
+	for(int i = 0; i < 4; i++) {
+		((uint8_t *)&hip.self_mac)[i +2] = ((uint8_t*)ROM_CFG_MAC_ADDR)[i];
+	}
+
 	blink(5);
 	uint32_t next_ms = funSysTick32() + Ticks_from_Ms(1);
 	uint32_t ms_cnt = 0;
@@ -225,9 +278,13 @@ int main( void ) {
 		if ( pkt && pkt_len > 0 && pkt_len <= SFHIP_MTU ) {
 			// hand packet to sfhip for processing
 			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
+			winot_release_packet();
+			printf("accepted frame of %d bytes\n", pkt_len);
 		}
 		else if ( pkt ) {
 			// exists but oversized
+			winot_release_packet();
+			printf("discarded frame of %d bytes\n", pkt_len);
 		}
 
 		if ( next_ms < funSysTick32() ) {
