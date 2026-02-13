@@ -16,7 +16,8 @@ import subprocess
 from time import sleep
 
 ETH_IFACE_NAME      = "enp1s0"
-HOST_MAC            = bytes([b for b in unhexlify(open('/sys/class/net/enp1s0/address').read().strip().replace(':',''))])
+HOST_MAC            = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFACE_NAME}/address').read().strip().replace(':',''))])
+HOST_IP             = b'\x00' *4
 MAC_PREFIX          = [0xc6, 0x32]
 ETH_P_ALL           = 3
 
@@ -55,6 +56,7 @@ def main():
     else:
         if args.interface:
             ETH_IFACE_NAME = args.interface
+            HOST_MAC = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFACE_NAME}/address').read().strip().replace(':',''))])
         router(usb_dev)
     
     print('done')
@@ -110,39 +112,48 @@ def process_usb_data(sock_ext, sock_lo, data):
         frame[:12] = b'\x00' *12
         sock_lo.send(frame)
     else:
-        sock_ext.send(frame)
         print(f"[USB -> ETH {len(frame)} bytes, {':'.join([format(x,'02x') for x in frame[6:12]])} -> {':'.join([format(x,'02x') for x in frame[:6]])}]")
+        sock_ext.send(frame)
 
 def process_eth_data(usb_dev, data):
+    global HOST_IP
     dest_mac = data[0:6]
     ethertype = data[12:14]
+
+    if ethertype != b'\x08\x00': # IPv4
+        return
+
     if dest_mac[:2] == bytes(MAC_PREFIX) or dest_mac == b'\xff\xff\xff\xff\xff\xff':
-        if ethertype == b'\x08\x00' and data[23] == 17: # 17 = UDP
-            if data[36:38] == b'\x00\x44':
-                parse_dhcp_ack(data)
+        if data[36:38] == b'\x00\x44' and data[23] == 17: # 17 = UDP
+            parse_dhcp_ack(data)
 
         # hexdump(data)
-        usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
         print(f"[ETH -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
+        usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
     elif data[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00':
         # from host over lo
-        if ethertype == b'\x08\x00': # IPv4
-            dest_ip = bytes(data[30:34])
-            
-            with arp_lock:
-                target_mac = arp_table.get(dest_ip)
-            
-            if target_mac:
-                # We know the MAC, rewrite header and send
-                if isinstance(data, bytes): data = bytearray(data)
-                data[0:6] = target_mac 
-                data[6:12] = HOST_MAC
-                # hexdump(data)
-                usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
-                print(f"[LO  -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
-            else:
-                print(f"[?] Unknown destination {socket.inet_ntoa(dest_ip)}. Probing...")
-                send_arp_request(usb_dev, dest_ip)
+        dest_ip = bytes(data[30:34])
+
+        if dest_ip == HOST_IP or dest_ip[0] == 127:
+            return
+
+        with arp_lock:
+            target_mac = arp_table.get(dest_ip)
+
+        if target_mac:
+            # We know the MAC, rewrite header and send
+            if isinstance(data, bytes): data = bytearray(data)
+            data[0:6] = target_mac
+            data[6:12] = HOST_MAC
+            # hexdump(data)
+            print(f"[LO  -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
+            usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
+        else:
+            print(f"[?] Unknown destination {socket.inet_ntoa(dest_ip)}. Probing...")
+            send_arp_request(usb_dev, dest_ip)
+    elif HOST_IP == b'\x00\x00\x00\x00' and dest_mac == HOST_MAC:
+        HOST_IP = data[30:34]
+        print(f"[*] Detected Host IP: {socket.inet_ntoa(HOST_IP)}")
 
 def parse_arp_packet(frame):
     sender_mac = frame[22:28]
