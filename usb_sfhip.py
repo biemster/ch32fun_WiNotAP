@@ -20,6 +20,8 @@ HOST_MAC            = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFA
 HOST_IP             = b'\x00' *4
 MAC_PREFIX          = [0xc6, 0x32]
 ETH_P_ALL           = 3
+ETH_TYPE_IP4        = b'\x08\x00'
+ETH_TYPE_ARP        = b'\x08\x06'
 
 CH_USB_VENDOR_ID    = 0x1209    # VID
 CH_USB_PRODUCT_ID   = 0xd035    # PID
@@ -103,7 +105,7 @@ def process_usb_data(sock_ext, sock_lo, data):
     dest_mac = frame[:6]
     ethertype = frame[12:14]
 
-    if ethertype == b'\x08\x06': # ARP
+    if ethertype == ETH_TYPE_ARP:
         parse_arp_packet(frame)
 
     if dest_mac == HOST_MAC:
@@ -120,17 +122,14 @@ def process_eth_data(usb_dev, data):
     dest_mac = data[0:6]
     ethertype = data[12:14]
 
-    if ethertype != b'\x08\x00': # IPv4
-        return
-
     if dest_mac[:2] == bytes(MAC_PREFIX) or dest_mac == b'\xff\xff\xff\xff\xff\xff':
-        if data[36:38] == b'\x00\x44' and data[23] == 17: # 17 = UDP
+        if ethertype == ETH_TYPE_IP4 and data[36:38] == b'\x00\x44' and data[23] == 17: # 17 = UDP
             parse_dhcp_ack(data)
 
         # hexdump(data)
         print(f"[ETH -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
         usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
-    elif data[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00':
+    elif ethertype == ETH_TYPE_IP4 and data[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00':
         # from host over lo
         dest_ip = bytes(data[30:34])
 
@@ -143,6 +142,7 @@ def process_eth_data(usb_dev, data):
         if target_mac:
             # We know the MAC, rewrite header and send
             if isinstance(data, bytes): data = bytearray(data)
+            fix_tcp_udp_checksum(data)
             data[0:6] = target_mac
             data[6:12] = HOST_MAC
             # hexdump(data)
@@ -151,9 +151,46 @@ def process_eth_data(usb_dev, data):
         else:
             print(f"[?] Unknown destination {socket.inet_ntoa(dest_ip)}. Probing...")
             send_arp_request(usb_dev, dest_ip)
-    elif HOST_IP == b'\x00\x00\x00\x00' and dest_mac == HOST_MAC:
+    elif ethertype == ETH_TYPE_IP4 and HOST_IP == b'\x00\x00\x00\x00' and dest_mac == HOST_MAC:
         HOST_IP = data[30:34]
         print(f"[*] Detected Host IP: {socket.inet_ntoa(HOST_IP)}")
+
+def fix_tcp_udp_checksum(frame):
+    # Recalculates TCP/UDP checksum for an Ethernet frame in-place.
+    if frame[23] not in (6, 17): return # 6=TCP, 17=UDP
+
+    # Parse Dimensions
+    # IP Header Length (IHL) is bottom 4 bits of byte 14 * 4
+    ip_hdr_len = (frame[14] & 0x0f) * 4
+    # IP Total Length (Bytes 16-17). Use this to ignore Ethernet padding.
+    ip_total_len = (frame[16] << 8) + frame[17]
+    transport_len = ip_total_len - ip_hdr_len
+
+    # Determine Offsets
+    transport_start = 14 + ip_hdr_len
+    # TCP Checksum is at byte 16, UDP at byte 6 of transport header
+    csum_pos = transport_start + (16 if frame[23] == 6 else 6)
+
+    # Prepare Data (Pseudo Header + Body)
+    # Zero out existing checksum field in the frame for calculation
+    frame[csum_pos] = 0; frame[csum_pos+1] = 0
+
+    # Pseudo Hdr: SrcIP(26:30) + DstIP(30:34) + Zero(1) + Proto(1) + Len(2)
+    pseudo = frame[26:34] + bytes([0, frame[23]]) + transport_len.to_bytes(2, 'big')
+
+    # Get body (slice exactly by length to exclude ethernet padding)
+    body = frame[transport_start : transport_start + transport_len]
+
+    # Calculate & Write
+    data = pseudo + body
+    if len(data) % 2: data += b'\x00' # Pad if odd length
+
+    s = sum(struct.unpack(f'!{len(data)//2}H', data))
+    s = (s >> 16) + (s & 0xffff); s += s >> 16
+
+    # Write result back to frame (Network Byte Order)
+    frame[csum_pos] = (~s & 0xffff) >> 8
+    frame[csum_pos+1] = (~s & 0xffff) & 0xff
 
 def parse_arp_packet(frame):
     sender_mac = frame[22:28]
@@ -206,7 +243,7 @@ def hexdump(data, length=16):
         print(f"{i:08x}: {hex_str}  |{ascii_str}|")
 
 def send_arp_request(usb_dev, target_ip):
-    eth_hdr = b'\xff\xff\xff\xff\xff\xff' + HOST_MAC + b'\x08\x06'
+    eth_hdr = b'\xff\xff\xff\xff\xff\xff' + HOST_MAC + ETH_TYPE_ARP
     arp_hdr = struct.pack('!HHBBH', 1, 0x0800, 6, 4, 1)
     sender_ip = b'\x00\x00\x00\x00' 
     target_mac_empty = b'\x00' * 6
