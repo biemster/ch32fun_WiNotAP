@@ -20,6 +20,7 @@ HOST_MAC            = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFA
 HOST_IP             = b'\x00' *4
 MAC_PREFIX          = [0xc6, 0x32]
 ETH_P_ALL           = 3
+ETH_PKT_OUTGOING    = 4
 ETH_TYPE_IP4        = b'\x08\x00'
 ETH_TYPE_ARP        = b'\x08\x06'
 
@@ -126,8 +127,8 @@ def process_eth_data(usb_dev, data):
         if ethertype == ETH_TYPE_IP4 and data[36:38] == b'\x00\x44' and data[23] == 17: # 17 = UDP
             parse_dhcp_ack(data)
 
-        # hexdump(data)
         print(f"[ETH -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
+        # hexdump(data)
         usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
     elif ethertype == ETH_TYPE_IP4 and data[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00':
         # from host over lo
@@ -145,8 +146,8 @@ def process_eth_data(usb_dev, data):
             fix_tcp_udp_checksum(data)
             data[0:6] = target_mac
             data[6:12] = HOST_MAC
-            # hexdump(data)
             print(f"[LO  -> USB {len(data)} bytes, {':'.join([format(x,'02x') for x in data[6:12]])} -> {':'.join([format(x,'02x') for x in data[:6]])}]")
+            # hexdump(data)
             usb_dev.write(CH_USB_EP_OUT, len(data).to_bytes(2, 'little') + data, timeout=CH_USB_TIMEOUT_MS)
         else:
             print(f"[?] Unknown destination {socket.inet_ntoa(dest_ip)}. Probing...")
@@ -270,7 +271,8 @@ def network_listener_thread(usb_dev, sock, iface, stop_event):
 
     while not stop_event.is_set():
         try:
-            frame, _ = sock.recvfrom(65535)
+            frame, addr_tuple = sock.recvfrom(65535)
+            if iface == 'lo' and addr_tuple[2] == ETH_PKT_OUTGOING: continue # drop outgoing duplicate
             process_eth_data(usb_dev, frame)
         except socket.timeout:
             continue
