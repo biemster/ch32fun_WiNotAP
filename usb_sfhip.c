@@ -40,28 +40,21 @@ int USBFS_SendEndpointNEW(int ep, uint8_t *data, int len, int copy) { return USB
 #endif
 #define MAC_PREFIX              0xc632 // should have used base 18
 
-#define USB_DATA_BUF_SIZE 2048
+#define HTTP_RESPONSE_BUF_SIZE  512
+
+#define USB_DATA_BUF_SIZE       2048
 __attribute__((aligned(4))) static volatile uint8_t gs_usb_data_buf[USB_DATA_BUF_SIZE];
 static int16_t gs_usb_data_len;
 static int gs_usb_data_write_idx;
 
-sfhip hip = {
-	.ip = 0,
-	.mask = 0,
-	.gateway = 0,
-	.self_mac = { { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 } }, // will be populated from part uuid
-	.hostname = "WiNotAP",
-	.need_to_discover = 1, // start w/ DHCP DISCOVER
-};
-
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
-const char http_response[] = "HTTP/1.1 200 OK\r\n"
-							 "Content-Type: text/plain\r\n"
-							 "Content-Length: 22\r\n"
-							 "Connection: close\r\n"
-							 "\r\n"
-							 "Hello from WiNotAP!\r\n";
+char hname[] = "WiNotAP_XXXXXXXX";
+char http_response[] = "HTTP/1.1 200 OK\r\n"
+						"Content-Type: text/plain\r\n"
+						"Content-Length: 22\r\n"
+						"Connection: close\r\n"
+						"\r\n";
 
 // track which sockets have already sent their HTTP response
 static bool response_sent[SFHIP_TCP_SOCKETS] = { false };
@@ -175,8 +168,8 @@ int HandleSetupCustom( struct _USBState *ctx, int setup_code ) {
 }
 
 // ----------
-// WiNot rx/tx
-int winot_send_packet(const uint8_t *data, int length) {
+// USB rx/tx
+int usb_send_packet(const uint8_t *data, int length) {
 	for(int i = 0; i < length; i += USBFS_PACKET_SIZE) {
 		if(USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0) == -1) {
 			// retry once
@@ -188,7 +181,7 @@ int winot_send_packet(const uint8_t *data, int length) {
 	return length;
 }
 
-uint8_t* winot_poll_packet(uint16_t *length) {
+uint8_t* usb_poll_packet(uint16_t *length) {
 	uint8_t *res = NULL;
 	if(gs_usb_data_len && gs_usb_data_write_idx == gs_usb_data_len) {
 		res = (uint8_t*)gs_usb_data_buf;
@@ -197,7 +190,7 @@ uint8_t* winot_poll_packet(uint16_t *length) {
 	return res;
 }
 
-void winot_release_packet() {
+void usb_release_packet() {
 	gs_usb_data_write_idx = 0;
 	gs_usb_data_len = 0;
 }
@@ -205,7 +198,7 @@ void winot_release_packet() {
 // ----------
 // sfhip instrumentation
 int sfhip_send_packet( sfhip *hip, sfhip_phy_packet *data, int length ) {
-	return winot_send_packet( (const uint8_t *)data, length );
+	return usb_send_packet( (const uint8_t *)data, length );
 }
 
 void sfhip_got_dhcp_lease( sfhip *hip, sfhip_address addr ) {
@@ -228,13 +221,17 @@ sfhip_length_or_tcp_code sfhip_tcp_event(
 	sfhip *hip, int sockno, uint8_t *ip_payload, int ip_payload_length, int max_out_payload, int acked ) {
 	// if we received data and haven't sent our response yet, send it now
 	if ( ip_payload_length > 0 && !response_sent[sockno] ) {
-		response_sent[sockno] = true;
+		char buf[HTTP_RESPONSE_BUF_SIZE] = {0};
 		int response_len = sizeof( http_response ) - 1; // -1 to exclude null term
-		if ( response_len > max_out_payload ) {
-			response_len = max_out_payload;
-		}
-		memcpy( ip_payload, http_response, response_len );
-		// printf( "." ); // debug: dot per request
+		memcpy( buf, http_response, (response_len > HTTP_RESPONSE_BUF_SIZE) ? HTTP_RESPONSE_BUF_SIZE : response_len );
+
+		memcpy( &buf[response_len], hname, sizeof(hname));
+		response_len += sizeof(hname) -1;
+		buf[response_len++] = '\r';
+		buf[response_len++] = '\n';
+
+		memcpy( ip_payload, buf, (response_len > max_out_payload) ? max_out_payload : response_len );
+		response_sent[sockno] = true;
 		return response_len;
 	}
 
@@ -261,29 +258,41 @@ int main( void ) {
 
 	USBFSSetup();
 
-	((uint8_t *)&hip.self_mac)[0] = MAC_PREFIX >> 8;
-	((uint8_t *)&hip.self_mac)[1] = MAC_PREFIX & 0xff;
+	hipmac mac = { { MAC_PREFIX >> 8, MAC_PREFIX & 0xff, 0, 0, 0, 0 } };
+	int hostname_mac_idx = strlen("WiNotAP_");
+	const char *hexlut = "0123456789abcdef";
 	for(int i = 0; i < 4; i++) {
-		((uint8_t *)&hip.self_mac)[i +2] = ((uint8_t*)ROM_CFG_MAC_ADDR)[i];
+		mac.mac[i +2] = ((uint8_t*)ROM_CFG_MAC_ADDR)[i];
+		hname[hostname_mac_idx++] = hexlut[(((uint8_t*)ROM_CFG_MAC_ADDR)[i] >> 4) & 0xf];
+		hname[hostname_mac_idx++] = hexlut[((uint8_t*)ROM_CFG_MAC_ADDR)[i] & 0xf];
 	}
+
+	sfhip hip = {
+		.ip = 0,
+		.mask = 0,
+		.gateway = 0,
+		.self_mac = mac, // will be populated from part uuid
+		.hostname = hname,
+		.need_to_discover = 1, // start w/ DHCP DISCOVER
+	};
 
 	blink(5);
 	uint32_t next_ms = funSysTick32() + Ticks_from_Ms(1);
 	uint32_t ms_cnt = 0;
 	while ( 1 ) {
 		uint16_t pkt_len;
-		const uint8_t *pkt = winot_poll_packet( &pkt_len );
+		const uint8_t *pkt = usb_poll_packet( &pkt_len );
 
 		// process received packet if valid and within MTU limits
 		if ( pkt && pkt_len > 0 && pkt_len <= SFHIP_MTU ) {
 			// hand packet to sfhip for processing
 			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
-			winot_release_packet();
+			usb_release_packet();
 			printf("accepted frame of %d bytes\n", pkt_len);
 		}
 		else if ( pkt ) {
 			// exists but oversized
-			winot_release_packet();
+			usb_release_packet();
 			printf("discarded frame of %d bytes\n", pkt_len);
 		}
 
