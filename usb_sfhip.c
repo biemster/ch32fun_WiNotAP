@@ -1,5 +1,6 @@
 #include "ch32fun.h"
 #include <stdio.h>
+#include "WiNot.h"
 
 #define SFHIP_WARN( x... ) printf( x )
 #define SFHIP_IMPLEMENTATION
@@ -50,11 +51,11 @@ static int gs_usb_data_write_idx;
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
 char hname[] = "WiNotAP_XXXXXXXX";
-char http_response[] = "HTTP/1.1 200 OK\r\n"
-						"Content-Type: text/plain\r\n"
-						"Content-Length: 22\r\n"
-						"Connection: close\r\n"
-						"\r\n";
+char http_response_header[] = "HTTP/1.1 200 OK\r\n"
+								"Content-Type: text/plain\r\n"
+								"Content-Length: 22\r\n"
+								"Connection: close\r\n"
+								"\r\n";
 
 // track which sockets have already sent their HTTP response
 static bool response_sent[SFHIP_TCP_SOCKETS] = { false };
@@ -222,8 +223,8 @@ sfhip_length_or_tcp_code sfhip_tcp_event(
 	// if we received data and haven't sent our response yet, send it now
 	if ( ip_payload_length > 0 && !response_sent[sockno] ) {
 		char buf[HTTP_RESPONSE_BUF_SIZE] = {0};
-		int response_len = sizeof( http_response ) - 1; // -1 to exclude null term
-		memcpy( buf, http_response, (response_len > HTTP_RESPONSE_BUF_SIZE) ? HTTP_RESPONSE_BUF_SIZE : response_len );
+		int response_len = sizeof( http_response_header ) - 1; // -1 to exclude null term
+		memcpy( buf, http_response_header, (response_len > HTTP_RESPONSE_BUF_SIZE) ? HTTP_RESPONSE_BUF_SIZE : response_len );
 
 		memcpy( &buf[response_len], hname, sizeof(hname));
 		response_len += sizeof(hname) -1;
@@ -276,6 +277,8 @@ int main( void ) {
 		.need_to_discover = 1, // start w/ DHCP DISCOVER
 	};
 
+	winot_init(WINOT_AP, LL_TX_POWER_0_DBM);
+
 	blink(5);
 	uint32_t next_ms = funSysTick32() + Ticks_from_Ms(1);
 	uint32_t ms_cnt = 0;
@@ -288,18 +291,19 @@ int main( void ) {
 			// hand packet to sfhip for processing
 			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
 			usb_release_packet();
-			printf("accepted frame of %d bytes\n", pkt_len);
+			printf("sfhip accepted frame of %d bytes\n", pkt_len);
 		}
 		else if ( pkt ) {
 			// exists but oversized
 			usb_release_packet();
-			printf("discarded frame of %d bytes\n", pkt_len);
+			printf("sfhip discarded frame of %d bytes\n", pkt_len);
 		}
 
 		if ( next_ms < funSysTick32() ) {
 			next_ms += Ticks_from_Ms(1);
 			ms_cnt++;
 			sfhip_tick( &hip, &scratch, /*dt_ms*/1 );
+			winot_tick( /*dt_ms*/1 );
 
 			if(!(ms_cnt %100)) printf(".");
 		}
