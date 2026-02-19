@@ -3,12 +3,10 @@
 # ch32fun_WiNotAP
 ch32fun iSLER WiNot AccessPoint, access points for WCH chips using Ethernet over RF
 
-!!! WIP !!!
-
-# ch32fun_WiNotAP
-ch32fun iSLER WiNot AccessPoint, access points for WCH chips using Ethernet over RF
+![WiNoT topology](WiNoT-fs8.png)
 
 ## iSLER WiNot protocol definition
+!!! this is not the final protocol, but a tryout to get the tooling around it in a functional state !!!\
 AP listens on channel 35 for communication requests from clients. All communication is initiated by the client using a request on the request channel.
 
 ### Request channel communication
@@ -27,7 +25,7 @@ AP listens on channel 35 for communication requests from clients. All communicat
 - c -> ap: `[PDU, len, payload[0], payload[1], ..., payload[len-1]]`
 3. AP and client exchange messages 1 by 1 in a round robin fashion, except when the PDU indicates fragmentation (see 5.)
 - ap -> c: `[PDU, len, payload[0], payload[1], ..., payload[len-1]]`
-4. The channel remains open for 500ms without communication in either way, after that a new data channel has to be requested by the client.
+4. The channel remains open for 10ms for fast path interaction, after that a new data channel has to be requested by the client.
 5. `iSLERRX(...)` and `TX(...)` specify a PDU byte, originally intended for BLE frame type. In WiNot this is used to indicate a fragmented ethernet frame. If bit 4 (0x08, b1000) of the PDU is set, it's part of a fragmented frame, with bits 1 to 3 indicating which part of the frame the current fragment is (fragment index).
 6. The last fragment will have a fragment index set and the fragment indicator byte (fourth bit) not set, indicating end of frame. The receiver (either client or AP) will acknowledge which fragments it received in it's next transmission by either sending it's own response data as acknowledgement, or by sending a retransmission request with all 4 LSB bits in the PDU set (0xf, b1111), and a payload with n bytes for n missing fragments indicating the missing fragments:
 - [ap,c] -> [c,ap]: `[PDU(0x0f), len(n missing fragments), missing_fragment_idx1, missing_fragment_idx2, ...]`
