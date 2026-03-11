@@ -44,6 +44,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-b', '--bootloader', help='Reboot to bootloader', action='store_true')
     parser.add_argument('-i', '--interface', help='Interface to bridge USB with')
+    parser.add_argument('--forward-broadcast', help='Forward broadcast messagges from LAN to USB', action='store_true')
     args = parser.parse_args()
 
     usb_dev = usb.core.find(idVendor=CH_USB_VENDOR_ID, idProduct=CH_USB_PRODUCT_ID)
@@ -60,20 +61,20 @@ def main():
         if args.interface:
             ETH_IFACE_NAME = args.interface
             HOST_MAC = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFACE_NAME}/address').read().strip().replace(':',''))])
-        router(usb_dev)
+        router(usb_dev, args.forward_broadcast)
     
     print('done')
 
 def bootloader(usb_dev):
     usb_dev.write(CH_USB_EP_OUT, CH_STR_REBOOT)
 
-def router(usb_dev):
+def router(usb_dev, arg_forward_broadcast):
     sock_ext = get_raw_socket(ETH_IFACE_NAME)
     sock_lo = get_raw_socket('lo')
 
     stop_event = threading.Event()
-    thread_ext = threading.Thread(target=network_listener_thread, args=(usb_dev, sock_ext, ETH_IFACE_NAME, stop_event), daemon=True)
-    thread_lo = threading.Thread(target=network_listener_thread, args=(usb_dev, sock_lo, 'lo', stop_event), daemon=True)
+    thread_ext = threading.Thread(target=network_listener_thread, args=(usb_dev, sock_ext, ETH_IFACE_NAME, stop_event, arg_forward_broadcast), daemon=True)
+    thread_lo = threading.Thread(target=network_listener_thread, args=(usb_dev, sock_lo, 'lo', stop_event, arg_forward_broadcast), daemon=True)
     thread_ext.start()
     thread_lo.start()
 
@@ -118,12 +119,12 @@ def process_usb_data(sock_ext, sock_lo, data):
         print(f"[USB -> ETH {len(frame)} bytes, {':'.join([format(x,'02x') for x in frame[6:12]])} -> {':'.join([format(x,'02x') for x in frame[:6]])}]")
         sock_ext.send(frame)
 
-def process_eth_data(usb_dev, data):
+def process_eth_data(usb_dev, data, is_forward_broadcast):
     global HOST_IP
     dest_mac = data[0:6]
     ethertype = data[12:14]
 
-    if dest_mac[:2] == bytes(MAC_PREFIX) or dest_mac == b'\xff\xff\xff\xff\xff\xff':
+    if dest_mac[:2] == bytes(MAC_PREFIX) or (is_forward_broadcast and dest_mac == b'\xff\xff\xff\xff\xff\xff'):
         if ethertype == ETH_TYPE_IP4 and data[36:38] == b'\x00\x44' and data[23] == 17: # 17 = UDP
             parse_dhcp_ack(data)
 
@@ -202,8 +203,7 @@ def parse_dhcp_ack(frame):
     if frame[42] != 2: return 
     ip = frame[58:62]
     mac = frame[70:76]
-    if ip != b'\x00\x00\x00\x00':
-         update_arp_table(ip, mac)
+    update_arp_table(ip, mac)
 
 def add_route(ip_str):
     try:
@@ -216,7 +216,7 @@ def add_route(ip_str):
 
 def update_arp_table(ip_bytes, mac_bytes):
     with arp_lock:
-        if ip_bytes not in arp_table:
+        if mac_bytes[:2] == bytes(MAC_PREFIX) and ip_bytes not in arp_table:
             ip_str = socket.inet_ntoa(ip_bytes)
             print(f"[+] Learned: IP={ip_str} is MAC={mac_bytes.hex(':')}")
             arp_table[ip_bytes] = mac_bytes
@@ -266,14 +266,14 @@ def get_raw_socket(iface_name):
         print(f"Error: You need root/sudo privileges to open a raw socket on {iface_name}.")
         exit(1)
 
-def network_listener_thread(usb_dev, sock, iface, stop_event):
+def network_listener_thread(usb_dev, sock, iface, stop_event, is_forward_broadcast):
     print(f"Starting Network -> USB Bridge on {iface}...")
 
     while not stop_event.is_set():
         try:
             frame, addr_tuple = sock.recvfrom(65535)
             if iface == 'lo' and addr_tuple[2] == ETH_PKT_OUTGOING: continue # drop outgoing duplicate
-            process_eth_data(usb_dev, frame)
+            process_eth_data(usb_dev, frame, is_forward_broadcast)
         except socket.timeout:
             continue
         except usb.core.USBError as e:
