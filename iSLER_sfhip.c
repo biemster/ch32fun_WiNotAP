@@ -1,5 +1,6 @@
 #include "ch32fun.h"
 #include <stdio.h>
+#include "WiNot.h"
 
 #define SFHIP_WARN( x... ) printf( x )
 #define SFHIP_IMPLEMENTATION
@@ -7,8 +8,6 @@
 #define SFHIP_TCP_SOCKETS 16
 
 #include "sfhip.h"
-
-#include "iSLER.h"
 
 #define HTTP_PORT 80
 
@@ -18,23 +17,21 @@
 #define LED PA8
 #endif
 
-sfhip hip = {
-	.ip = 0,
-	.mask = 0,
-	.gateway = 0,
-	.self_mac = { { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 } }, // will be populated from part uuid
-	.hostname = "WiNotAP",
-	.need_to_discover = 1, // start w/ DHCP DISCOVER
-};
+#ifndef ROM_CFG_MAC_ADDR // should be updated in ch5xxhw.h
+#define ROM_CFG_MAC_ADDR        ((const u32*)0x0007f018)
+#endif
+#define MAC_PREFIX              0xc632 // should have used base 18
+
+#define HTTP_RESPONSE_BUF_SIZE  512
 
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
-const char http_response[] = "HTTP/1.1 200 OK\r\n"
-							 "Content-Type: text/plain\r\n"
-							 "Content-Length: 22\r\n"
-							 "Connection: close\r\n"
-							 "\r\n"
-							 "Hello from WiNotAP!\r\n";
+char hname[] = "WiNot_XXXXXXXX";
+char http_response_header[] = "HTTP/1.1 200 OK\r\n"
+							  "Content-Type: text/plain\r\n"
+							  "Content-Length: 16\r\n"
+							  "Connection: close\r\n"
+							  "\r\n";
 
 // track which sockets have already sent their HTTP response
 static bool response_sent[SFHIP_TCP_SOCKETS] = { false };
@@ -50,18 +47,9 @@ void blink(int n) {
 }
 
 // ----------
-// WiNot rx/tx
-int winot_send_packet(const uint8_t *data, int length) {
-	return 0;
-}
-
-uint8_t* winot_poll_packet(uint16_t *length) {
-	return NULL;
-}
-
-// ----------
 // sfhip instrumentation
 int sfhip_send_packet( sfhip *hip, sfhip_phy_packet *data, int length ) {
+	// printf("sfhip sent frame of %d bytes over WiNoT\n", length);
 	return winot_send_packet( (const uint8_t *)data, length );
 }
 
@@ -75,6 +63,7 @@ void sfhip_got_dhcp_lease( sfhip *hip, sfhip_address addr ) {
 // 0 to accept, -1 to reject
 int sfhip_tcp_accept_connection( sfhip *hip, int sockno, int localport, hipbe32 remote_host ) {
 	if ( localport == HIPHTONS( HTTP_PORT ) ) {
+		putchar('8');
 		return 0;
 	}
 	return -1;
@@ -85,13 +74,17 @@ sfhip_length_or_tcp_code sfhip_tcp_event(
 	sfhip *hip, int sockno, uint8_t *ip_payload, int ip_payload_length, int max_out_payload, int acked ) {
 	// if we received data and haven't sent our response yet, send it now
 	if ( ip_payload_length > 0 && !response_sent[sockno] ) {
+		char buf[HTTP_RESPONSE_BUF_SIZE] = {0};
+		int response_len = sizeof( http_response_header ) - 1; // -1 to exclude null term
+		memcpy( buf, http_response_header, (response_len > HTTP_RESPONSE_BUF_SIZE) ? HTTP_RESPONSE_BUF_SIZE : response_len );
+
+		memcpy( &buf[response_len], hname, sizeof(hname));
+		response_len += sizeof(hname) -1;
+		buf[response_len++] = '\r';
+		buf[response_len++] = '\n';
+
+		memcpy( ip_payload, buf, (response_len > max_out_payload) ? max_out_payload : response_len );
 		response_sent[sockno] = true;
-		int response_len = sizeof( http_response ) - 1; // -1 to exclude null term
-		if ( response_len > max_out_payload ) {
-			response_len = max_out_payload;
-		}
-		memcpy( ip_payload, http_response, response_len );
-		// printf( "." ); // debug: dot per request
 		return response_len;
 	}
 
@@ -108,13 +101,42 @@ void sfhip_tcp_socket_closed( sfhip *hip, int sockno ) {
 	response_sent[sockno] = false;
 }
 
+static inline void task_10ms() {}
+static inline void task_100ms() {
+	// printf(".");
+	winot_request(NULL, 0); // ask if there is data
+}
+static inline void task_1s() {}
+static inline void task_10s() {}
+static inline void task_100s() {}
+
 // ----------
 int main( void ) {
 	SystemInit();
-	printf( "iSLER sfhip test (DHCP)\n" );
+	printf( "iSLER/WiNoT sfhip test (DHCP)\n" );
 
 	funGpioInitAll();
 	funPinMode( LED, GPIO_CFGLR_OUT_2Mhz_PP );
+
+	hipmac mac = { { MAC_PREFIX >> 8, MAC_PREFIX & 0xff, 0, 0, 0, 0 } };
+	int hostname_mac_idx = strlen("WiNot_");
+	const char *hexlut = "0123456789abcdef";
+	for(int i = 0; i < 4; i++) {
+		mac.mac[i +2] = ((uint8_t*)ROM_CFG_MAC_ADDR)[i];
+		hname[hostname_mac_idx++] = hexlut[(((uint8_t*)ROM_CFG_MAC_ADDR)[i] >> 4) & 0xf];
+		hname[hostname_mac_idx++] = hexlut[((uint8_t*)ROM_CFG_MAC_ADDR)[i] & 0xf];
+	}
+
+	sfhip hip = {
+		.ip = 0,
+		.mask = 0,
+		.gateway = 0,
+		.self_mac = mac, // will be populated from part uuid
+		.hostname = hname,
+		.need_to_discover = 1, // start w/ DHCP DISCOVER
+	};
+
+	winot_init(WINOT_CLIENT, LL_TX_POWER_0_DBM);
 
 	blink(5);
 	uint32_t next_ms = funSysTick32() + Ticks_from_Ms(1);
@@ -127,17 +149,31 @@ int main( void ) {
 		if ( pkt && pkt_len > 0 && pkt_len <= SFHIP_MTU ) {
 			// hand packet to sfhip for processing
 			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
+			if(pkt_len == 130 || pkt_len == 98) { // HTTP GET on port 80 or ICMP
+				printf("%02x %02x %02x %02x %02x %02x\n", pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
+				printf("%02x %02x %02x %02x %02x %02x\n", pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11]);
+				printf("%02x %02x\n", pkt[pkt_len -2], pkt[pkt_len -1]);
+			}
+			winot_release_packet();
+			// printf("sfhip accepted frame of %d bytes\n", pkt_len);
 		}
 		else if ( pkt ) {
 			// exists but oversized
+			winot_release_packet();
+			// printf("sfhip discarded frame of %d bytes\n", pkt_len);
 		}
 
-		if ( next_ms < funSysTick32() ) {
+		if ( next_ms < funSysTick32() ) { // DONT FORGET TO FIX THIS! IT WILL RUN OUT THE UINT32 AND STOP
 			next_ms += Ticks_from_Ms(1);
 			ms_cnt++;
 			sfhip_tick( &hip, &scratch, /*dt_ms*/1 );
+			winot_tick( /*dt_ms*/1 );
 
-			if(!(ms_cnt %100)) printf(".");
+			if(!(ms_cnt %10)) task_10ms();
+			if(!(ms_cnt %100)) task_100ms();
+			if(!(ms_cnt %1000)) task_1s();
+			if(!(ms_cnt %10000)) task_10s();
+			if(!(ms_cnt %100000)) task_100s();
 		}
 	}
 }

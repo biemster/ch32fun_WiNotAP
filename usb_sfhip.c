@@ -37,23 +37,25 @@ int USBFS_SendEndpointNEW(int ep, uint8_t *data, int len, int copy) { return USB
 #endif
 
 #ifndef ROM_CFG_MAC_ADDR // should be updated in ch5xxhw.h
-#define ROM_CFG_MAC_ADDR		((const u32*)0x0007f018)
+#define ROM_CFG_MAC_ADDR         ((const u32*)0x0007f018)
 #endif
-#define MAC_PREFIX              0xc632 // should have used base 18
+#define MAC_PREFIX               0xc632 // should have used base 18
 
-#define HTTP_RESPONSE_BUF_SIZE  512
+#define HTTP_RESPONSE_BUF_SIZE   512
 
-#define USB_DATA_BUF_SIZE       2048
+#define USB_DATA_BUF_SIZE        2048
+#define USB_DATA_BUF_CORRUPT_CHK 1000
 __attribute__((aligned(4))) static volatile uint8_t gs_usb_data_buf[USB_DATA_BUF_SIZE];
 static int16_t gs_usb_data_len;
 static int gs_usb_data_write_idx;
+static int gs_usb_data_buf_corruption_check;
 
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
 char hname[] = "WiNotAP_XXXXXXXX";
 char http_response_header[] = "HTTP/1.1 200 OK\r\n"
 								"Content-Type: text/plain\r\n"
-								"Content-Length: 22\r\n"
+								"Content-Length: 18\r\n"
 								"Connection: close\r\n"
 								"\r\n";
 
@@ -110,14 +112,16 @@ void HandleDataOut(struct _USBState *ctx, int endp, uint8_t *data, int len) {
 	}
 	else if (endp == EP_FRAME_OUT) {
 		if(len == 4 && ((uint32_t*)data)[0] == 0x010001a2) {
+			iSLERStop();
 			USBFSReset();
 			blink(2);
 			jump_isprom();
 		}
-		else {
+		else if(len > 0) {
 			// received (part of) an ethernet frame
-			if(gs_usb_data_len == 0) {
-				// first part of frame
+			if((gs_usb_data_len == 0) || (gs_usb_data_write_idx == gs_usb_data_len)) {
+				// first part of frame (if len == write_idx, this overwrites the not-yet-processed frame)
+				gs_usb_data_buf_corruption_check = 0;
 				gs_usb_data_len = *(int16_t*)data;
 				if(len == USBFS_PACKET_SIZE || len == gs_usb_data_len +2) {
 					memcpy((uint8_t*)gs_usb_data_buf, &data[2], len -2);
@@ -127,9 +131,6 @@ void HandleDataOut(struct _USBState *ctx, int endp, uint8_t *data, int len) {
 					// first two bytes were definitely not frame len
 					gs_usb_data_len = 0;
 				}
-			}
-			else if(gs_usb_data_write_idx == gs_usb_data_len) {
-				// previous frame is not processed yet, drop this frame
 			}
 			else if((gs_usb_data_write_idx +len) > gs_usb_data_len) {
 				// something went wrong, we're getting more data than the frame should be
@@ -171,15 +172,15 @@ int HandleSetupCustom( struct _USBState *ctx, int setup_code ) {
 // ----------
 // USB rx/tx
 int usb_send_packet(const uint8_t *data, int length) {
+	int res = length;
 	for(int i = 0; i < length; i += USBFS_PACKET_SIZE) {
 		if(USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0) == -1) {
 			// retry once
-			Delay_Ms(1);
-			USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0);
+			Delay_Us(500);
+			res = USBFS_SendEndpointNEW(EP_FRAME_IN, (uint8_t*)&data[i], ((length -i > USBFS_PACKET_SIZE) ? USBFS_PACKET_SIZE : (length -i)), /*copy*/0);
 		}
 	}
-	printf("sent frame of %d bytes\n", length);
-	return length;
+	return res;
 }
 
 uint8_t* usb_poll_packet(uint16_t *length) {
@@ -187,6 +188,14 @@ uint8_t* usb_poll_packet(uint16_t *length) {
 	if(gs_usb_data_len && gs_usb_data_write_idx == gs_usb_data_len) {
 		res = (uint8_t*)gs_usb_data_buf;
 		*length = gs_usb_data_len;
+	}
+	else if(gs_usb_data_len) {
+		if(gs_usb_data_buf_corruption_check++ > USB_DATA_BUF_CORRUPT_CHK) {
+			// discard current data
+			// TODO: figure out where this blows up
+			gs_usb_data_write_idx = 0;
+			gs_usb_data_len = 0;
+		}
 	}
 	return res;
 }
@@ -199,6 +208,7 @@ void usb_release_packet() {
 // ----------
 // sfhip instrumentation
 int sfhip_send_packet( sfhip *hip, sfhip_phy_packet *data, int length ) {
+	// printf("sfhip sent frame of %d bytes over USB\n", length);
 	return usb_send_packet( (const uint8_t *)data, length );
 }
 
@@ -249,10 +259,20 @@ void sfhip_tcp_socket_closed( sfhip *hip, int sockno ) {
 	response_sent[sockno] = false;
 }
 
+static inline void task_10ms() {}
+static inline void task_100ms() {
+	// printf(".");
+}
+static inline void task_1s() {}
+static inline void task_10s() {
+	// winot_print_routing_table();
+}
+static inline void task_100s() {}
+
 // ----------
 int main( void ) {
 	SystemInit();
-	printf( "USB sfhip test (DHCP)\n" );
+	// printf( "USB sfhip test (DHCP)\n" );
 
 	funGpioInitAll();
 	funPinMode( LED, GPIO_CFGLR_OUT_2Mhz_PP );
@@ -283,29 +303,82 @@ int main( void ) {
 	uint32_t next_ms = funSysTick32() + Ticks_from_Ms(1);
 	uint32_t ms_cnt = 0;
 	while ( 1 ) {
-		uint16_t pkt_len;
-		const uint8_t *pkt = usb_poll_packet( &pkt_len );
+		/////
+		// Check for USB data
+		uint16_t usb_pkt_len;
+		const uint8_t *usb_pkt = usb_poll_packet( &usb_pkt_len );
 
-		// process received packet if valid and within MTU limits
-		if ( pkt && pkt_len > 0 && pkt_len <= SFHIP_MTU ) {
-			// hand packet to sfhip for processing
-			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
+		if ( usb_pkt && usb_pkt_len > 0) {
+			// check if it is for us or for a WiNoT node
+			if(WINOT_DATA_DEST_UUID(usb_pkt) == *ROM_CFG_MAC_ADDR) {
+				// for us, process received packet if valid and within MTU limits
+				if( usb_pkt_len <= SFHIP_MTU ) {
+					// hand packet to sfhip for processing
+					sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)usb_pkt, usb_pkt_len );
+					// printf("sfhip accepted USB frame of %d bytes\n", usb_pkt_len);
+				}
+				else {
+					// exists but oversized
+					printf("sfhip discarded USB frame of %d bytes\n", usb_pkt_len);
+				}
+			}
+			else {
+				// for a node on WiNoT
+				if( usb_pkt_len <= WINOT_DATA_BUF_SIZE ) {
+					winot_send_packet( usb_pkt, usb_pkt_len );
+					// printf("WiNoT sent frame of %d bytes\n", usb_pkt_len);
+				}
+				else {
+					// exists but oversized
+					printf("WiNoT discarded frame of %d bytes\n", usb_pkt_len);
+				}
+			}
+
 			usb_release_packet();
-			printf("sfhip accepted frame of %d bytes\n", pkt_len);
-		}
-		else if ( pkt ) {
-			// exists but oversized
-			usb_release_packet();
-			printf("sfhip discarded frame of %d bytes\n", pkt_len);
 		}
 
-		if ( next_ms < funSysTick32() ) {
+		/////
+		// Check for WiNoT data
+		uint16_t winot_pkt_len;
+		const uint8_t *winot_pkt = winot_poll_packet( &winot_pkt_len );
+
+		if ( winot_pkt && winot_pkt_len > 0) {
+			// check if it is for us or for the LAN
+			if(WINOT_DATA_DEST_UUID(winot_pkt) == *ROM_CFG_MAC_ADDR) {
+				// for us, process received packet if valid and within MTU limits
+				if( winot_pkt_len <= SFHIP_MTU ) {
+					// hand packet to sfhip for processing
+					sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)winot_pkt, winot_pkt_len );
+					// printf("sfhip accepted WiNoT frame of %d bytes\n", winot_pkt_len);
+				}
+				else {
+					// exists but oversized
+					printf("sfhip discarded WiNoT frame of %d bytes\n", winot_pkt_len);
+				}
+			}
+			else {
+				// for the LAN
+				int sent = usb_send_packet(winot_pkt, winot_pkt_len);
+				// printf("routed WiNoT frame of %d bytes to USB (%d)\n", winot_pkt_len, sent);
+			}
+
+			winot_release_packet();
+		}
+
+
+		/////
+		// tick the subsystems
+		if ( next_ms < funSysTick32() ) { // DONT FORGET TO FIX THIS! IT WILL RUN OUT THE UINT32 AND STOP
 			next_ms += Ticks_from_Ms(1);
 			ms_cnt++;
 			sfhip_tick( &hip, &scratch, /*dt_ms*/1 );
 			winot_tick( /*dt_ms*/1 );
 
-			if(!(ms_cnt %100)) printf(".");
+			if(!(ms_cnt %10)) task_10ms();
+			if(!(ms_cnt %100)) task_100ms();
+			if(!(ms_cnt %1000)) task_1s();
+			if(!(ms_cnt %10000)) task_10s();
+			if(!(ms_cnt %100000)) task_100s();
 		}
 	}
 }
