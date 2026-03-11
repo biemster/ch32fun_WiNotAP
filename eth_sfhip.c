@@ -131,7 +131,7 @@ int main( void )
 			eth_release_rx_packet();
 		}
 
-		if ( next_ms < funSysTick32() ) {
+		if ( next_ms < funSysTick32() ) { // DONT FORGET TO FIX THIS! IT WILL RUN OUT THE UINT32 AND STOP
 			next_ms += Ticks_from_Ms(1);
 			ms_cnt++;
 			sfhip_tick( &hip, &scratch, /*dt_ms*/1 );
