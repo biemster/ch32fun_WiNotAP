@@ -50,6 +50,7 @@ void blink(int n) {
 // sfhip instrumentation
 int sfhip_send_packet( sfhip *hip, sfhip_phy_packet *data, int length ) {
 	// printf("sfhip sent frame of %d bytes over WiNoT\n", length);
+	winot_release_packet();
 	return winot_send_packet( (const uint8_t *)data, length );
 }
 
@@ -63,7 +64,6 @@ void sfhip_got_dhcp_lease( sfhip *hip, sfhip_address addr ) {
 // 0 to accept, -1 to reject
 int sfhip_tcp_accept_connection( sfhip *hip, int sockno, int localport, hipbe32 remote_host ) {
 	if ( localport == HIPHTONS( HTTP_PORT ) ) {
-		putchar('8');
 		return 0;
 	}
 	return -1;
@@ -149,12 +149,9 @@ int main( void ) {
 		if ( pkt && pkt_len > 0 && pkt_len <= SFHIP_MTU ) {
 			// hand packet to sfhip for processing
 			sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)pkt, pkt_len );
-			if(pkt_len == 130 || pkt_len == 98) { // HTTP GET on port 80 or ICMP
-				printf("%02x %02x %02x %02x %02x %02x\n", pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
-				printf("%02x %02x %02x %02x %02x %02x\n", pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11]);
-				printf("%02x %02x\n", pkt[pkt_len -2], pkt[pkt_len -1]);
+			if(winot_state() == WINOT_NEWRX) {
+				winot_release_packet();
 			}
-			winot_release_packet();
 			// printf("sfhip accepted frame of %d bytes\n", pkt_len);
 		}
 		else if ( pkt ) {

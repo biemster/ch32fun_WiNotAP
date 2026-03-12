@@ -50,6 +50,12 @@ static int16_t gs_usb_data_len;
 static int gs_usb_data_write_idx;
 static int gs_usb_data_buf_corruption_check;
 
+typedef enum {
+	IFACE_USB,
+	IFACE_WINOT,
+} sfhip_last_iface_t;
+sfhip_last_iface_t gs_sfhip_last_pkt_interface;
+
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
 char hname[] = "WiNotAP_XXXXXXXX";
@@ -209,7 +215,14 @@ void usb_release_packet() {
 // sfhip instrumentation
 int sfhip_send_packet( sfhip *hip, sfhip_phy_packet *data, int length ) {
 	// printf("sfhip sent frame of %d bytes over USB\n", length);
-	return usb_send_packet( (const uint8_t *)data, length );
+	if(gs_sfhip_last_pkt_interface == IFACE_USB) {
+		return usb_send_packet( (const uint8_t *)data, length );
+	}
+	else if(gs_sfhip_last_pkt_interface == IFACE_WINOT) {
+		winot_release_packet();
+		return winot_send_packet( (const uint8_t *)data, length );
+	}
+	return 0;
 }
 
 void sfhip_got_dhcp_lease( sfhip *hip, sfhip_address addr ) {
@@ -314,6 +327,7 @@ int main( void ) {
 				// for us, process received packet if valid and within MTU limits
 				if( usb_pkt_len <= SFHIP_MTU ) {
 					// hand packet to sfhip for processing
+					gs_sfhip_last_pkt_interface = IFACE_USB;
 					sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)usb_pkt, usb_pkt_len );
 					// printf("sfhip accepted USB frame of %d bytes\n", usb_pkt_len);
 				}
@@ -348,6 +362,7 @@ int main( void ) {
 				// for us, process received packet if valid and within MTU limits
 				if( winot_pkt_len <= SFHIP_MTU ) {
 					// hand packet to sfhip for processing
+					gs_sfhip_last_pkt_interface = IFACE_WINOT;
 					sfhip_accept_packet( &hip, (sfhip_phy_packet_mtu *)winot_pkt, winot_pkt_len );
 					// printf("sfhip accepted WiNoT frame of %d bytes\n", winot_pkt_len);
 				}
