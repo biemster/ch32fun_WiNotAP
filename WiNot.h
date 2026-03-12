@@ -292,12 +292,22 @@ WiNot_state winot_request(const uint8_t *data, int len) {
 			iSLERTX(WINOT_AP_ACCESSADDRESS, response, 8, WINOT_AP_CHANNEL, PHY_1M);
 		}
 		else {
+			if(len > 0) {
+				if(data == gs_winot_data_buf) {
+					// this happens when a protocol stack writes its response back into the request buffer
+					// we just need to move the data 8 bytes to the left to make room for the header
+					// TODO: figure out if there is a faster way to do this
+					for(int i = len -1; i >= 0; i--) {
+						gs_winot_data_buf[i +8] = gs_winot_data_buf[i];
+					}
+				}
+				else {
+					memcpy((uint8_t*)&gs_winot_data_buf[8], data, len);
+				}
+			}
 			gs_winot_data_buf[0] = 0;// pdu not fragmented
 			*(uint32_t*)&gs_winot_data_buf[4] = WINOT_ACCESSADDRESS_PRIV;
 			gs_winot_data_len = 0;
-			if(len > 0) {
-				memcpy((uint8_t*)&gs_winot_data_buf[8], data, len);
-			}
 			iSLERTX(WINOT_AP_ACCESSADDRESS, (uint8_t*)gs_winot_data_buf, 8+len, WINOT_AP_CHANNEL, PHY_1M);
 		}
 		winot_change_state(WINOT_REQUESTING);
