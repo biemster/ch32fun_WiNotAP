@@ -14,6 +14,8 @@ from binascii import unhexlify
 import threading
 import subprocess
 from time import sleep
+import paho.mqtt.publish as mqtt_publish
+import requests
 
 ETH_IFACE_NAME      = "enp1s0"
 HOST_MAC            = bytes([b for b in unhexlify(open(f'/sys/class/net/{ETH_IFACE_NAME}/address').read().strip().replace(':',''))])
@@ -23,6 +25,9 @@ ETH_P_ALL           = 3
 ETH_PKT_OUTGOING    = 4
 ETH_TYPE_IP4        = b'\x08\x00'
 ETH_TYPE_ARP        = b'\x08\x06'
+
+SIDECHANNEL_MQTT    = 0x01
+SIDECHANNEL_NTFY_SH = 0x02
 
 CH_USB_VENDOR_ID    = 0x1209    # VID
 CH_USB_PRODUCT_ID   = 0xd035    # PID
@@ -110,7 +115,11 @@ def process_usb_data(sock_ext, sock_lo, data):
     if ethertype == ETH_TYPE_ARP:
         parse_arp_packet(frame)
 
-    if dest_mac == HOST_MAC:
+    if dest_mac == b'\x00\x00\x00\x00\x00\x00':
+        # side channel
+        sidechannel_msg = frame[6:]
+        process_sidechannel(sidechannel_msg[0], sidechannel_msg[1:])
+    elif dest_mac == HOST_MAC:
         print(f"[USB -> LO  {len(frame)} bytes, {':'.join([format(x,'02x') for x in frame[6:12]])} -> {':'.join([format(x,'02x') for x in frame[:6]])}]")
         if isinstance(frame, bytes): frame = bytearray(frame)
         frame[:12] = b'\x00' *12
@@ -156,6 +165,22 @@ def process_eth_data(usb_dev, data, is_forward_broadcast):
     elif ethertype == ETH_TYPE_IP4 and HOST_IP == b'\x00\x00\x00\x00' and dest_mac == HOST_MAC:
         HOST_IP = data[30:34]
         print(f"[*] Detected Host IP: {socket.inet_ntoa(HOST_IP)}")
+
+def process_sidechannel(channel, data):
+    if channel == SIDECHANNEL_MQTT:
+        server_ip = '.'.join([str(x) for x in data[:4]])
+        separator_idx = data.find(b'/')
+        mqtt_topic = data[4:separator_idx].decode('ascii')
+        mqtt_msg = data[separator_idx+1:]
+        mqtt_publish.single(mqtt_topic, payload=mqtt_msg, hostname=server_ip)
+    elif channel == SIDECHANNEL_NTFY_SH:
+        server_ip = '.'.join([str(x) for x in data[:4]])
+        separator_idx = data.find(b'/')
+        ntfy_topic = data[4:separator_idx].decode('ascii')
+        ntfy_msg = data[separator_idx+1:]
+        requests.post(f'http://{server_ip}/{ntfy_topic}', data=ntfy_msg)
+    else:
+        printf(f'[E] Sidechannel {channel} not supported, message dropped')
 
 def fix_tcp_udp_checksum(frame):
     # Recalculates TCP/UDP checksum for an Ethernet frame in-place.

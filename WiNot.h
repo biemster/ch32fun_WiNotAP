@@ -40,6 +40,11 @@ typedef enum {
 static WiNot_role gs_role;
 
 typedef enum {
+	WINOT_SIDECHANNEL_MQTT = 1,
+	WINOT_SIDECHANNEL_NTFY_SH,
+} sidechannel_t;
+
+typedef enum {
 	WINOT_IDLE = 0,
 	WINOT_LISTENING,
 	WINOT_REQUESTING,
@@ -109,6 +114,9 @@ void winot_burst_tx_and_communicate(uint32_t access_address, uint8_t channel, co
 
 		__attribute__((aligned(4))) static uint8_t tx_buf[WINOT_FRAGMENT_SIZE +4]; // static to use global RAM, not stack
 		tx_buf[0] = pdu;
+		tx_buf[1] = len +2;
+		tx_buf[2] = 0; // no side channel
+		tx_buf[3] = 0; // dummy
 		memcpy(&tx_buf[4], &data[sent], chunk);
 
 		iSLERTX(access_address, tx_buf, chunk +4, channel, PHY_1M);
@@ -183,39 +191,51 @@ void winot_process_rx() {
 	if(gs_role == WINOT_AP && gs_state == WINOT_LISTENING) {
 		len -= 4; // on the request channel header is 4 bytes larger
 		int response_len = 0;
+		uint8_t sidechannel = frame[2];
 		uint32_t client_uuid = *(uint32_t*)&frame[4];
 		int ap_needs_datachannel = (gs_winot_data_len && (gs_winot_data_len > WINOT_FRAGMENT_SIZE) && (client_uuid == WINOT_DATA_DEST_UUID(gs_winot_data_buf)));
 		int client_needs_datachannel = (pdu & WINOT_FRAGMENTED);
 
 		gs_datachannel[WINOT_ACTIVE_DATACHANNEL] = winot_routing_table_store(client_uuid);
 
-		if(!ap_needs_datachannel && !client_needs_datachannel) {
+		if((!ap_needs_datachannel && !client_needs_datachannel) || sidechannel) {
 			gs_datachannel[WINOT_ACTIVE_DATACHANNEL] = WINOT_AP_CHANNEL;
 		}
 
-		__attribute__((aligned(4))) static uint8_t response[WINOT_FRAGMENT_SIZE + 8] = {0};
-		response[0] = 0; // pdu
-		response[2] = (uint8_t)gs_datachannel[WINOT_ACTIVE_DATACHANNEL];
-		*(uint32_t*)&response[4] = WINOT_ACCESSADDRESS_PRIV;
+		if(!sidechannel) {
+			__attribute__((aligned(4))) static uint8_t response[WINOT_FRAGMENT_SIZE + 8] = {0};
+			response[0] = 0; // pdu
+			response[2] = (uint8_t)gs_datachannel[WINOT_ACTIVE_DATACHANNEL];
+			*(uint32_t*)&response[4] = WINOT_ACCESSADDRESS_PRIV;
 
-		if(gs_winot_data_len && !ap_needs_datachannel) {
-			// copy AP data into response to client
-			memcpy(response +8, (uint8_t*)gs_winot_data_buf, gs_winot_data_len);
-			response_len = gs_winot_data_len;
-			gs_winot_data_len = 0;
+			if(gs_winot_data_len && !ap_needs_datachannel) {
+				// copy AP data into response to client
+				memcpy(response +8, (uint8_t*)gs_winot_data_buf, gs_winot_data_len);
+				response_len = gs_winot_data_len;
+				gs_winot_data_len = 0;
+			}
+
+			if(len) {
+				// copy client request data into AP buffer
+				// If we had data waiting for another client or that did not fit in the response, we drop that
+				memcpy((uint8_t*)gs_winot_data_buf, frame +8, len);
+				gs_winot_data_len = len;
+				winot_change_state(WINOT_NEWRX);
+			}
+
+			iSLERTX(client_uuid, response, response_len +8, WINOT_AP_CHANNEL, PHY_1M);
+			if(gs_state != WINOT_NEWRX) {
+				winot_change_state((response[2] == WINOT_AP_CHANNEL) ? WINOT_LISTENING : WINOT_COMMUNICATING);
+			}
 		}
-
-		if(len) {
-			// copy client request data into AP buffer
-			// If we had data waiting for another client or that did not fit in the response, we drop that
-			memcpy((uint8_t*)gs_winot_data_buf, frame +8, len);
-			gs_winot_data_len = len;
+		else {
+			// side channel
+			memset((uint8_t*)gs_winot_data_buf, 0, 6);
+			gs_winot_data_buf[6] = sidechannel;
+			memcpy((uint8_t*)gs_winot_data_buf +7, frame +8, len);
+			gs_winot_data_len = len +7;
 			winot_change_state(WINOT_NEWRX);
-		}
 
-		iSLERTX(client_uuid, response, response_len +8, WINOT_AP_CHANNEL, PHY_1M);
-		if(gs_state != WINOT_NEWRX) {
-			winot_change_state((response[2] == WINOT_AP_CHANNEL) ? WINOT_LISTENING : WINOT_COMMUNICATING);
 		}
 	}
 	else if(gs_role == WINOT_CLIENT && gs_state == WINOT_REQUESTING) {
@@ -287,7 +307,10 @@ WiNot_state winot_request(const uint8_t *data, int len) {
 			gs_winot_data_len = len;
 
 			__attribute__((aligned(4))) static uint8_t response[8] = {0};
-			response[0] = WINOT_FRAGMENTED;// pdu fragmented, ask for data channel
+			response[0] = WINOT_FRAGMENTED; // pdu fragmented, ask for data channel
+			response[1] = 6;                // 8 byte header minus first two bytes
+			response[2] = 0;                // not a side channel
+			response[3] = 0;                // dummy, set 0
 			*(uint32_t*)&response[4] = WINOT_ACCESSADDRESS_PRIV;
 			iSLERTX(WINOT_AP_ACCESSADDRESS, response, 8, WINOT_AP_CHANNEL, PHY_1M);
 		}
@@ -305,7 +328,10 @@ WiNot_state winot_request(const uint8_t *data, int len) {
 					memcpy((uint8_t*)&gs_winot_data_buf[8], data, len);
 				}
 			}
-			gs_winot_data_buf[0] = 0;// pdu not fragmented
+			gs_winot_data_buf[0] = 0;      // pdu not fragmented
+			gs_winot_data_buf[1] = len +6; // payload length + header minus first two bytes
+			gs_winot_data_buf[2] = 0;      // not a side channel
+			gs_winot_data_buf[3] = 0;      // dummy, set 0
 			*(uint32_t*)&gs_winot_data_buf[4] = WINOT_ACCESSADDRESS_PRIV;
 			gs_winot_data_len = 0;
 			iSLERTX(WINOT_AP_ACCESSADDRESS, (uint8_t*)gs_winot_data_buf, 8+len, WINOT_AP_CHANNEL, PHY_1M);
@@ -333,6 +359,25 @@ int winot_send_packet(const uint8_t *data, int len) {
 	}
 
 	return len;
+}
+
+int winot_sidechannel_tx(uint8_t sidechannel, const uint8_t *data, int len) {
+	int res = 0;
+	if(len > WINOT_FRAGMENT_SIZE) return -1;
+
+	if(gs_role == WINOT_CLIENT && gs_state == WINOT_IDLE) {
+		gs_winot_data_buf[0] = 0;// pdu not fragmented
+		gs_winot_data_buf[1] = len +6;
+		gs_winot_data_buf[2] = sidechannel;
+		gs_winot_data_buf[3] = 0; // dummy
+		*(uint32_t*)&gs_winot_data_buf[4] = WINOT_ACCESSADDRESS_PRIV;
+		memcpy((uint8_t*)gs_winot_data_buf +8, data, len);
+		iSLERTX(WINOT_AP_ACCESSADDRESS, (uint8_t*)gs_winot_data_buf, 8+len, WINOT_AP_CHANNEL, PHY_1M);
+		gs_winot_data_len = 0;
+		res = len;
+	}
+
+	return res;
 }
 
 uint8_t* winot_poll_packet(uint16_t *len) {

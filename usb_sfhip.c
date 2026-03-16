@@ -390,10 +390,10 @@ int main( void ) {
 			winot_tick( /*dt_ms*/1 );
 
 			if(!(ms_cnt %10)) task_10ms();
-			if(!(ms_cnt %100)) task_100ms();
-			if(!(ms_cnt %1000)) task_1s();
-			if(!(ms_cnt %10000)) task_10s();
-			if(!(ms_cnt %100000)) task_100s();
+			if(!((ms_cnt %100) -5)) task_100ms();
+			if(!((ms_cnt %1000) -10)) task_1s();
+			if(!((ms_cnt %10000) -20)) task_10s();
+			if(!((ms_cnt %100000) -30)) task_100s();
 		}
 	}
 }

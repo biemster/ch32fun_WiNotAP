@@ -26,6 +26,7 @@
 
 static sfhip_phy_packet_mtu scratch __attribute__( ( aligned( 4 ) ) );
 
+const char *hexlut = "0123456789abcdef";
 char hname[] = "WiNot_XXXXXXXX";
 char http_response_header[] = "HTTP/1.1 200 OK\r\n"
 							  "Content-Type: text/plain\r\n"
@@ -35,6 +36,8 @@ char http_response_header[] = "HTTP/1.1 200 OK\r\n"
 
 // track which sockets have already sent their HTTP response
 static bool response_sent[SFHIP_TCP_SOCKETS] = { false };
+static int gs_has_ip;
+static int gs_has_announced;
 
 
 void blink(int n) {
@@ -58,6 +61,7 @@ void sfhip_got_dhcp_lease( sfhip *hip, sfhip_address addr ) {
 	uint32_t ip = HIPNTOHL( addr );
 	printf( "\nGot IP: %lu.%lu.%lu.%lu\n", ( ip >> 24 ) & 0xFF, ( ip >> 16 ) & 0xFF, ( ip >> 8 ) & 0xFF, ip & 0xFF );
 	printf( "HTTP server ready at http://%lu.%lu.%lu.%lu/\n\n", ( ip >> 24 ) & 0xFF, ( ip >> 16 ) & 0xFF, ( ip >> 8 ) & 0xFF, ip & 0xFF );
+	gs_has_ip = 1;
 }
 
 // called by sfhip when a new TCP connection arrives
@@ -96,9 +100,26 @@ sfhip_length_or_tcp_code sfhip_tcp_event(
 	return 0; // no action needed
 }
 
-
 void sfhip_tcp_socket_closed( sfhip *hip, int sockno ) {
 	response_sent[sockno] = false;
+}
+
+
+int announce_up() {
+	uint8_t sidechannel_msg[] = "XXXXch32fun/Hi from UUUUUUUU!";
+	int uuid_idx = strlen("XXXXch32fun/Hi from ");
+	for(int i = 0; i < 4; i++) {
+		sidechannel_msg[uuid_idx++] = hexlut[(((uint8_t*)ROM_CFG_MAC_ADDR)[i] >> 4) & 0xf];
+		sidechannel_msg[uuid_idx++] = hexlut[((uint8_t*)ROM_CFG_MAC_ADDR)[i] & 0xf];
+	}
+
+	memcpy(sidechannel_msg, (uint8_t[]){192,168,1,12}, 4); // MQTT server
+	int res_mqtt = winot_sidechannel_tx(WINOT_SIDECHANNEL_MQTT, sidechannel_msg, sizeof(sidechannel_msg) -1);
+	Delay_Us(500); // don't overwhelm the AP
+	memcpy(sidechannel_msg, (uint8_t[]){159,203,148,75}, 4); // ntfy.sh server
+	int res_ntfy = winot_sidechannel_tx(WINOT_SIDECHANNEL_NTFY_SH, sidechannel_msg, sizeof(sidechannel_msg) -1);
+
+	return ((res_mqtt > 0) && (res_ntfy > 0)) ? res_ntfy : 0;;
 }
 
 static inline void task_10ms() {}
@@ -106,7 +127,13 @@ static inline void task_100ms() {
 	// printf(".");
 	winot_request(NULL, 0); // ask if there is data
 }
-static inline void task_1s() {}
+static inline void task_1s() {
+	if(!gs_has_announced && gs_has_ip) {
+		if(announce_up() > 0) {
+			gs_has_announced = 1;
+		}
+	}
+}
 static inline void task_10s() {}
 static inline void task_100s() {}
 
@@ -120,7 +147,6 @@ int main( void ) {
 
 	hipmac mac = { { MAC_PREFIX >> 8, MAC_PREFIX & 0xff, 0, 0, 0, 0 } };
 	int hostname_mac_idx = strlen("WiNot_");
-	const char *hexlut = "0123456789abcdef";
 	for(int i = 0; i < 4; i++) {
 		mac.mac[i +2] = ((uint8_t*)ROM_CFG_MAC_ADDR)[i];
 		hname[hostname_mac_idx++] = hexlut[(((uint8_t*)ROM_CFG_MAC_ADDR)[i] >> 4) & 0xf];
@@ -167,10 +193,10 @@ int main( void ) {
 			winot_tick( /*dt_ms*/1 );
 
 			if(!(ms_cnt %10)) task_10ms();
-			if(!(ms_cnt %100)) task_100ms();
-			if(!(ms_cnt %1000)) task_1s();
-			if(!(ms_cnt %10000)) task_10s();
-			if(!(ms_cnt %100000)) task_100s();
+			if(!((ms_cnt %100) -5)) task_100ms();
+			if(!((ms_cnt %1000) -10)) task_1s();
+			if(!((ms_cnt %10000) -20)) task_10s();
+			if(!((ms_cnt %100000) -30)) task_100s();
 		}
 	}
 }
